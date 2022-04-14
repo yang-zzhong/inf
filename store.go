@@ -1,269 +1,146 @@
-package store
+package inf
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 )
 
-// how content organized
-// meta = version:uint32 + total:uint32 + block_size
-// index = size:uint32 + offset:uint32
-// meta + [512]index + [512]item
-
-// item = content:[1024]byte + next:uint32
-
-// +-------------------------------------------------------------------
-// |+----------------+|+-----+ +-------+     | +----------+
-// ||01 512 1024 1024|||21 0 | | 4392 1| ... | |010010 342|
-// |+----------------+|+-----+ +-------+     | +----------+
-// +-------------------------------------------------------------------
-
-type Item interface {
-	Size() uint32
-	Head() uint32
-	Reader() io.Reader
-	Writer() io.Writer
-}
-
-type Chunk interface {
-	Total() int
-	At(idx int) (Item, error)
-	Set(idx int, item Item) error
-	Add(item Item) error
+type Store interface {
+	Add(io.Reader) error
 	Del(idx int) error
+	Put(idx int, r io.Reader) error
+	Get(idx int) (io.Reader, error)
 }
 
-type fileChunk struct {
-	pathfile string
-	file     *File
-
-	version      uint32
-	block        uint16
-	total        uint32
-	firstEmptyAt uint32
-
-	metaCollected bool
-}
-
-type index struct {
-	state     uint8
-	size      uint32
-	headBlock uint32
-}
-
-type block struct {
-	state   uint8
-	nextPos uint32
-	prevPos uint32
-	next    *block
-	content []byte
-}
+type version uint32
+type state uint8
 
 const (
-	metaSize   = 14
-	itemSize   = 9
-	capability = 2048
-	magicSize  = 7
-	itemFrom   = metaSize + 2
-	version    = 1
-	blockSize  = 64
+	V1_1       uint32 = 0x00000001
+	magicSize         = 16
+	metaSize          = 32
+	indexSize         = 19
+	indexBegin        = magicSize + metaSize
 
-	empty  = uint8(0)
-	filled = uint8(1)
+	stateEmpty   state = 0
+	stateCreated state = 1
+	stateDeleted state = 2
 )
 
 var (
-	ErrBrokenFile        = errors.New("broken file")
-	magicNumber   []byte = []byte{'p', 'e', 'p', 'e', '.', 'c', 'h'}
+	magic         = []byte{'f', '.', 's', 'f', 's'}
+	ErrEmptyStore = errors.New("empty store")
 )
 
-func FileChunk(pathfile string) *fileChunk {
-	return &fileChunk{
+type index struct {
+	state          state
+	prev           uint32
+	next           uint32
+	firstSegmentAt int64
+	segments       uint16
+}
+
+type segment struct {
+	index uint32
+	prev  int64
+	next  int64
+}
+
+type store struct {
+	pathfile    string
+	file        *file
+	v           version
+	indexTotal  uint32
+	indexCount  uint32
+	segmentSize uint16
+	indexes     []index
+}
+
+func New(pathfile string) *store {
+	return &store{
 		pathfile: pathfile,
-		version:  version,
-		block:    blockSize}
+	}
 }
 
-func (chunk *fileChunk) Open() (err error) {
-	if chunk.file != nil {
-		return
-	}
-	var file *os.File
-	file, err = os.OpenFile(chunk.pathfile, os.O_RDWR|os.O_CREATE, 0755)
+func (store *store) Open() error {
+	file, err := os.Open(store.pathfile)
 	if err != nil {
-		return
+		return fmt.Errorf("can't open file: %w", err)
 	}
-	chunk.file = NewFile(file)
-	defer func() {
-		if err != nil {
-			chunk.file.Close()
-		}
-	}()
-	var info os.FileInfo
-	info, err = chunk.file.Stat()
-	if info.Size() == 0 {
-		if _, err = chunk.file.Write(magicNumber); err != nil {
-			return
-		}
-		if err = chunk.makeMeta(); err != nil {
-			return
-		}
-		for i := 0; i < int(chunk.total); i++ {
-			if err = chunk.makeIndex(i, 0, empty, 0); err != nil {
-				return
-			}
-		}
-		return
-	} else if info.Size() < 7 {
-		err = errors.New("bad file format")
-		return
+	store.file = NewFile(file)
+	if err := store.verifyMagicNumber(); err != nil {
+		return fmt.Errorf("can't verify magic number: %w", err)
 	}
+	if err := store.initIndexes(); err != nil {
+		return fmt.Errorf("can't init indexes: %w", err)
+	}
+	return nil
+}
+
+func (store *store) verifyMagicNumber() error {
 	mb := make([]byte, magicSize)
-	if _, err = chunk.file.Read(mb); err != nil {
-		return
-	}
-	if !bytes.Equal(mb, magicNumber) {
-		err = errors.New("bad file format")
-	}
-	return chunk.collectMeta()
-}
-
-func (chunk *fileChunk) Close() error {
-	if err := chunk.file.Close(); err != nil {
+	if _, err := store.file.ReadAt(0, os.SEEK_SET, mb); err != nil {
 		return err
 	}
-	chunk.file = nil
-	return nil
-}
-
-func (chunk *fileChunk) makeMeta() error {
-	bs := make([]byte, metaSize)
-	binary.BigEndian.PutUint32(bs[:4], chunk.version)
-	binary.BigEndian.PutUint16(bs[4:6], chunk.block)
-	binary.BigEndian.PutUint32(bs[6:10], chunk.total)
-	binary.BigEndian.PutUint32(bs[10:14], chunk.firstEmptyAt)
-	_, err := chunk.file.WriteAt(magicSize, os.SEEK_SET, bs)
-	return err
-}
-
-func (chunk *fileChunk) makeIndex(idx int, size uint32, state uint8, headBlock uint32) (err error) {
-	index := index{
-		size:      size,
-		state:     state,
-		headBlock: headBlock,
-	}
-	bs := make([]byte, itemSize)
-	bs[0] = byte(state)
-	binary.BigEndian.PutUint32(bs[1:5], index.size)
-	binary.BigEndian.PutUint32(bs[5:9], index.headBlock)
-	pos := itemFrom + idx*itemSize
-	if _, err = chunk.file.WriteAt(int64(pos), os.SEEK_SET, bs); err != nil {
-		return err
+	if !bytes.Equal(mb, magic) {
+		return errors.New("not a .sfs file")
 	}
 	return nil
 }
 
-func (chunk *fileChunk) readIndex(idx int, index *index) (err error) {
-	pos := itemFrom + idx*itemSize
-	bs := make([]byte, itemSize)
-	if _, err = chunk.file.ReadAt(int64(pos), os.SEEK_SET, bs); err != nil {
+func (store *store) initIndexes() error {
+	var index index
+	if err := store.getRandomNonEmptyIndex(&index); err != nil {
+		if errors.Is(err, ErrEmptyStore) {
+			return nil
+		}
+		return err
+	}
+	store.indexes = append(store.indexes, index)
+	return store.initIndexFrom(0)
+}
+
+func (store *store) initIndexFrom(idx int) error {
+	ind := store.indexes[idx]
+	if ind.prev != 0 {
+		var prev index
+		store.readIndexAt(ind.prev, &prev)
+		store.indexes = append(store.indexes[:idx], prev, store.indexes[idx:]...)
+	}
+}
+
+func (store *store) getRandomNonEmptyIndex(index *index) error {
+	for i := 0; i < int(store.indexTotal); i++ {
+		if err := store.readIndex(i, index); err != nil {
+			return err
+		}
+		if index.state == stateCreated {
+			return nil
+		}
+	}
+	return ErrEmptyStore
+}
+
+func (store *store) readIndexAt(pos uint32, index *index) (err error) {
+	if pos >= indexBegin+indexSize*store.indexTotal {
+		return errors.New("index out of range")
+	}
+	bs := make([]byte, indexSize)
+	if _, err = store.file.ReadAt(int64(pos), os.SEEK_SET, bs); err != nil {
 		return
 	}
-	index.state = uint8(bs[0])
-	index.size = binary.BigEndian.Uint32(bs[1:5])
-	index.headBlock = binary.BigEndian.Uint32(bs[5:9])
+	index.state = state(bs[0])
+	index.prev = binary.BigEndian.Uint32(bs[1:5])
+	index.next = binary.BigEndian.Uint32(bs[5:9])
+	index.firstSegmentAt = int64(binary.BigEndian.Uint64(bs[9:17]))
+	index.segments = binary.BigEndian.Uint16(bs[17:19])
 	return
 }
 
-func (chunk *fileChunk) collectMeta() error {
-	if chunk.metaCollected {
-		return nil
-	}
-	bs := make([]byte, metaSize)
-	read, err := chunk.file.ReadAt(magicSize, os.SEEK_SET, bs)
-	if err != nil {
-		return err
-	}
-	if read != metaSize {
-		return ErrBrokenFile
-	}
-	chunk.version = binary.BigEndian.Uint32(bs[:4])
-	chunk.block = binary.BigEndian.Uint16(bs[4:6])
-	chunk.total = binary.BigEndian.Uint32(bs[6:10])
-	chunk.firstEmptyAt = binary.BigEndian.Uint32(bs[10:14])
-	chunk.metaCollected = true
-	return nil
-}
-
-func (chunk *fileChunk) syncFirstEmptyAt() error {
-	bs := make([]byte, 4)
-	binary.BigEndian.PutUint32(bs, chunk.firstEmptyAt)
-	_, err := chunk.file.WriteAt(magicSize+10, os.SEEK_SET, bs)
-	return err
-}
-
-func (chunk *fileChunk) Total() uint32 {
-	return chunk.total
-}
-
-func (chunk *fileChunk) At(idx int) (item Item, err error) {
-	return
-}
-
-func (chunk *fileChunk) Full() bool {
-	return chunk.firstEmptyAt == chunk.total-1
-}
-
-func (chunk *fileChunk) Add(item Item) error {
-	if chunk.Full() {
-		return errors.New("chunk fulled")
-	}
-	pos, err := chunk.file.EndPos()
-	if err != nil {
-		return err
-	}
-	if err := chunk.makeIndex(int(chunk.firstEmptyAt), item.Size(), filled, uint32(pos)); err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			chunk.file.Truncate(int64(pos))
-		}
-	}()
-	var read uint32
-	var prevPos uint32 = 0
-	for read < item.Size() {
-		blk := block{
-			content: make([]byte, chunk.block),
-			prevPos: prevPos,
-			nextPos: 0,
-			state:   filled,
-		}
-		bs := make([]byte, chunk.block)
-		bs[0] = blk.state
-		binary.BigEndian.PutUint32(bs[1:5], blk.prevPos)
-		rl, err := item.Reader().Read(bs[9:])
-		if err != nil {
-			return err
-		}
-		if !(rl < int(chunk.block) && read+uint32(chunk.block) > item.Size()) {
-			blk.nextPos = uint32(pos + int64(chunk.block))
-		}
-		binary.BigEndian.PutUint32(bs[5:9], blk.nextPos)
-		read += uint32(rl)
-		_, err = chunk.file.WriteAt(pos, os.SEEK_SET, bs)
-		if err != nil {
-			return err
-		}
-		prevPos = uint32(pos)
-		pos = int64(blk.nextPos)
-	}
-	chunk.firstEmptyAt += 1
-	if err := chunk.syncFirstEmptyAt(); err != nil {
-		return err
-	}
-	return nil
+func (store *store) readIndex(idx int, index *index) (err error) {
+	return store.readIndex(indexBegin+idx*indexSize, index)
 }

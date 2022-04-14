@@ -1,20 +1,20 @@
-package store
+package inf
 
 import (
 	"os"
 	"sync"
 )
 
-type File struct {
+type file struct {
 	rlock sync.Mutex
 	*os.File
 }
 
-func NewFile(file *os.File) *File {
-	return &File{File: file}
+func NewFile(f *os.File) *file {
+	return &file{File: f}
 }
 
-func (file *File) ReadAt(pos int64, whence int, bs []byte) (read int, err error) {
+func (file *file) ReadAt(pos int64, whence int, bs []byte) (read int, err error) {
 	file.rlock.Lock()
 	defer file.rlock.Unlock()
 	if _, err = file.File.Seek(pos, whence); err != nil {
@@ -23,7 +23,7 @@ func (file *File) ReadAt(pos int64, whence int, bs []byte) (read int, err error)
 	return file.File.Read(bs)
 }
 
-func (file *File) WriteAt(pos int64, whence int, bs []byte) (read int, err error) {
+func (file *file) WriteAt(pos int64, whence int, bs []byte) (read int, err error) {
 	file.rlock.Lock()
 	defer file.rlock.Unlock()
 	if _, err = file.File.Seek(pos, whence); err != nil {
@@ -32,7 +32,7 @@ func (file *File) WriteAt(pos int64, whence int, bs []byte) (read int, err error
 	return file.File.Write(bs)
 }
 
-func (file *File) EndPos() (end int64, err error) {
+func (file *file) EndPos() (end int64, err error) {
 	file.rlock.Lock()
 	defer file.rlock.Unlock()
 	end, err = file.File.Seek(0, os.SEEK_END)
