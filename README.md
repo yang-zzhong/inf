@@ -42,6 +42,7 @@ we wanna hold max 10K elements, so the index area size is `18 * 10K`
 
 `segment`
 
+* state [uint8]
 * index [uint32]
 * prev [int64]
 * next [int64]
