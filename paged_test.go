@@ -7,7 +7,7 @@ import (
 )
 
 func testPaged(t *testing.T, test func(s *pagedStore)) {
-	s := New("./testdata/chunk")
+	s := New(FileRWSC("./testdata/chunk"))
 	if err := s.Create(V010000, 512); err != nil {
 		t.Fatalf("new file chunk error: %s", err.Error())
 	}
@@ -18,6 +18,10 @@ func testPaged(t *testing.T, test func(s *pagedStore)) {
 func cleanup(handle func()) {
 	defer os.Remove("./testdata/chunk")
 	handle()
+}
+
+func Test_version_String(t *testing.T) {
+	fmt.Printf("version: %s\n", V010000.String())
 }
 
 func TestPaged(t *testing.T) {
@@ -34,6 +38,14 @@ func TestPaged(t *testing.T) {
 				s.Get(pages[i].idx, &pages[i])
 				fmt.Printf("%s - %d\n", pages[i].Data, pages[i].Next)
 			}
+			for i := 1; i <= 2; i++ {
+				if err := s.Free(i); err != nil {
+					panic(err)
+				}
+				fmt.Printf("%v\n", s)
+			}
+			pages = s.Acquire(5)
+			fmt.Printf("%v\n", pages)
 		})
 	})
 }
