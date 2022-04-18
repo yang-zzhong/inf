@@ -161,8 +161,14 @@ func (s *pagedStore) Acquire(count int) []Page {
 		freeIdx := s.freeHead
 		for i < count {
 			if freeIdx != 0 {
-				ret[i] = Page{idx: freeIdx, size: s.pageSize}
 				freeIdx = s.readFreeNext(freeIdx)
+				next := freeIdx
+				if i == count-1 {
+					next = 0
+				} else if next == 0 {
+					next = s.total
+				}
+				ret[i] = Page{idx: freeIdx, size: s.pageSize, Next: next}
 				i++
 				continue
 			}
@@ -170,7 +176,11 @@ func (s *pagedStore) Acquire(count int) []Page {
 		}
 		rest := count - i
 		for i := 0; i < rest; i++ {
-			ret[i] = Page{idx: s.total + i + 1, size: s.pageSize - 5, allocate: true}
+			next := s.total + i + 1
+			if i == rest-1 {
+				next = 0
+			}
+			ret[i] = Page{idx: s.total + i + 1, size: s.pageSize - 5, allocate: true, Next: next}
 		}
 		return nil
 	})
@@ -179,15 +189,13 @@ func (s *pagedStore) Acquire(count int) []Page {
 
 func (s *pagedStore) Free(idx int) error {
 	return s.ensure(func() error {
-		bs := s.pagePool.Get().([]byte)
-		bs[0] = byte(TypeFree)
-		binary.BigEndian.PutUint32(bs[1:5], 0)
-		pos := s.pagePos(idx)
-		if _, err := s.file.Seek(pos, os.SEEK_SET); err != nil {
+		if err := s.putFreePage(idx, 0); err != nil {
 			return err
 		}
-		if _, err := s.file.Write(bs[:5]); err != nil {
-			return err
+		if s.freeTail != 0 {
+			if err := s.putFreePage(s.freeTail, idx); err != nil {
+				return err
+			}
 		}
 		if err := s.modifyFreeNext(s.freeTail, idx); err != nil {
 			return err
@@ -197,6 +205,22 @@ func (s *pagedStore) Free(idx int) error {
 		}
 		return nil
 	})
+}
+
+func (s *pagedStore) putFreePage(idx int, next int) error {
+	bs := s.pagePool.Get().([]byte)
+	defer s.pagePool.Put(bs)
+	bs[0] = byte(TypeFree)
+	binary.BigEndian.PutUint16(bs[1:3], 0)
+	binary.BigEndian.PutUint32(bs[3:7], uint32(next))
+	pos := s.pagePos(idx)
+	if _, err := s.file.Seek(pos, os.SEEK_SET); err != nil {
+		return err
+	}
+	if _, err := s.file.Write(bs[:7]); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *pagedStore) Put(pages []Page) error {
@@ -212,41 +236,30 @@ func (s *pagedStore) Put(pages []Page) error {
 			binary.BigEndian.PutUint16(bs[1:3], uint16(len(pages[i].Data)))
 			binary.BigEndian.PutUint32(bs[3:7], uint32(pages[i].Next))
 			copy(bs[7:7+len(pages[i].Data)], pages[i].Data)
-			if pages[i].allocate {
-				if _, err := s.file.Seek(0, os.SEEK_END); err != nil {
-					return err
-				}
-				if _, err := s.file.Write(bs); err != nil {
-					return err
-				}
-				s.total = s.total + 1
-				continue
-			}
-			if pages[i].idx != freeHead {
+			pos := s.pagePos(pages[i].idx)
+			if !pages[i].allocate && pages[i].idx != freeHead {
 				return fmt.Errorf("put must begin with free head")
 			}
-			pos := s.pagePos(pages[i].idx)
 			if _, err := s.file.Seek(pos, os.SEEK_SET); err != nil {
 				return err
 			}
 			if _, err := s.file.Write(bs); err != nil {
 				return err
 			}
-			if i < len(pages)-1 {
-				if pages[i+1].allocate {
-					freeHead = 0
-					s.freeTail = 0
-				} else {
-					freeHead = pages[i].idx
-				}
+			if i == len(pages)-1 {
+				continue
+			}
+			if pages[i+1].allocate {
+				freeHead = 0
+				s.freeTail = 0
 			} else {
 				freeHead = s.readFreeNext(freeHead)
-				if freeHead == 0 {
-					s.freeTail = 0
-				}
 			}
 		}
 		s.freeHead = freeHead
+		if s.freeHead == 0 {
+			s.freeTail = 0
+		}
 		s.syncMetaData()
 		return nil
 	})
@@ -257,6 +270,7 @@ func (s *pagedStore) Get(idx int, page *Page) error {
 		bs := s.pagePool.Get().([]byte)
 		defer s.pagePool.Put(bs)
 		pos := s.pagePos(idx)
+		fmt.Printf("index: %d - at: %d\n", idx, pos)
 		if _, err := s.file.Seek(pos, os.SEEK_SET); err != nil {
 			return err
 		}
@@ -289,6 +303,7 @@ func (s *pagedStore) readFreeNext(freeIdx int) (nextIdx int) {
 		panic(err)
 	}
 	bs := s.pagePool.Get().([]byte)
+	defer s.pagePool.Put(bs)
 	if _, err := s.file.Read(bs); err != nil {
 		panic(err)
 	}
@@ -296,7 +311,6 @@ func (s *pagedStore) readFreeNext(freeIdx int) (nextIdx int) {
 		panic("not a free page")
 	}
 	nextIdx = int(binary.BigEndian.Uint32(bs[1:5]))
-	s.pagePool.Put(bs)
 	return
 }
 

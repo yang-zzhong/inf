@@ -32,7 +32,7 @@ func TestPaged(t *testing.T) {
 			s.Put(pages)
 			for i := range pages {
 				s.Get(pages[i].idx, &pages[i])
-				fmt.Printf("%v\n", pages[i])
+				fmt.Printf("%s - %d\n", pages[i].Data, pages[i].Next)
 			}
 		})
 	})
