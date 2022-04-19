@@ -3,17 +3,22 @@ package inf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 )
 
-type PageStore interface {
-	Free(idx int) error
-	Acquire(idx int) []Page
-	Put([]Page) error
-	Get(idx int, p *Page) error
+type BlockStore interface {
+	Erase(idx int) error
+	Acquire(lenInBytes int) ([]Block, error)
+	Put([]Block) error
+	Get(idx int, p *Block) error
+	DataSize() uint16
+	From(idx int) ([]Block, error)
+	WriteTo(w io.Writer, idx int) ([]Block, error)
 }
 
 type (
@@ -25,7 +30,9 @@ const (
 	magicSize   = 16
 	metaSize    = 104
 	dataStartAt = 128
-	TypeFree    = Type(0)
+	TypeEmpty   = Type(0)
+	TypeSuper   = Type(1)
+	TypeData    = Type(2)
 )
 
 var (
@@ -61,11 +68,11 @@ type RWSC interface {
 	io.Closer
 }
 
-type pagedStore struct {
-	v        version
-	pageSize uint16
-	rwsNew   func() (RWSC, error)
-	pathfile string
+type blockStore struct {
+	v         version
+	blockSize uint16
+	rwsNew    func() (RWSC, error)
+	pathfile  string
 
 	rws      RWSC
 	freeHead int
@@ -75,9 +82,9 @@ type pagedStore struct {
 	prepared bool
 }
 
-var _ PageStore = &pagedStore{}
+var _ BlockStore = &blockStore{}
 
-type Page struct {
+type Block struct {
 	Type Type
 	Next int
 	Data []byte
@@ -93,17 +100,21 @@ func FileRWSC(pathfile string) func() (RWSC, error) {
 	}
 }
 
-func (p Page) Size() uint16 {
+func (p Block) Size() uint16 {
 	return p.size
 }
 
-func New(rwsNew func() (RWSC, error)) *pagedStore {
-	return &pagedStore{rwsNew: rwsNew}
+func (p Block) Index() int {
+	return p.idx
 }
 
-func (s *pagedStore) Create(v version, pageSize uint16) (err error) {
+func New(rwsNew func() (RWSC, error)) *blockStore {
+	return &blockStore{rwsNew: rwsNew}
+}
+
+func (s *blockStore) Create(v version, blockSize uint16) (err error) {
 	s.v = v
-	s.pageSize = pageSize
+	s.blockSize = blockSize
 	if s.rws, err = s.rwsNew(); err != nil {
 		return
 	}
@@ -119,26 +130,24 @@ func (s *pagedStore) Create(v version, pageSize uint16) (err error) {
 		return
 	}
 	s.pagePool.New = func() interface{} {
-		return make([]byte, s.pageSize)
+		return make([]byte, s.blockSize)
 	}
-	ff := s.pagePool.Get().([]byte)
-	defer s.pagePool.Put(ff)
-	// write page in pos 0, this page is not for use
-	if _, err := s.rws.Write(ff); err != nil {
+	// write super block, this block can not free
+	if err := s.putPage(0, TypeSuper, 0, []byte{}); err != nil {
 		return err
 	}
 	s.prepared = true
 	return nil
 }
 
-func (s *pagedStore) Close() error {
+func (s *blockStore) Close() error {
 	if s.prepared {
 		return s.rws.Close()
 	}
 	return nil
 }
 
-func (s *pagedStore) Open() (err error) {
+func (s *blockStore) Open() (err error) {
 	if s.rws, err = s.rwsNew(); err != nil {
 		err = fmt.Errorf("can't open file: %w", err)
 		return
@@ -162,34 +171,38 @@ func (s *pagedStore) Open() (err error) {
 		err = fmt.Errorf("unsupported version")
 		return
 	}
-	s.pageSize = binary.BigEndian.Uint16(bs[start : start+2])
+	s.blockSize = binary.BigEndian.Uint16(bs[start : start+2])
 	s.freeHead = int(binary.BigEndian.Uint32(bs[start+2 : start+6]))
 	s.freeTail = int(binary.BigEndian.Uint32(bs[start+6 : start+10]))
 	s.total = int(binary.BigEndian.Uint32(bs[start+10 : start+14]))
 
 	s.pagePool.New = func() interface{} {
-		return make([]byte, s.pageSize)
+		return make([]byte, s.blockSize)
 	}
 	s.prepared = true
 	return nil
 }
 
-func (s *pagedStore) Acquire(count int) []Page {
-	ret := make([]Page, count)
-	s.ensure(func() error {
+func (s *blockStore) Acquire(lenInBytes int) (blocks []Block, err error) {
+	count := int(math.Ceil(float64(lenInBytes) / float64(s.DataSize())))
+	blocks = make([]Block, count)
+	err = s.ensure(func() error {
 		i := 0
 		freeIdx := s.freeHead
 		for i < count {
 			if freeIdx == 0 || freeIdx == s.total+1 {
 				break
 			}
-			next := s.readFreeNext(freeIdx)
+			next, err := s.nextFreeBlock(freeIdx)
+			if err != nil {
+				return err
+			}
 			if i == count-1 {
 				next = 0
 			} else if next == 0 {
 				next = s.total + 1
 			}
-			ret[i] = Page{idx: freeIdx, size: s.pageSize - 7, Next: next}
+			blocks[i] = Block{Type: TypeData, idx: freeIdx, size: s.DataSize(), Next: next}
 			freeIdx = next
 			i++
 		}
@@ -200,20 +213,23 @@ func (s *pagedStore) Acquire(count int) []Page {
 			if i == count-1 {
 				next = 0
 			}
-			ret[i] = Page{idx: idx, size: s.pageSize - 7, allocate: true, Next: next}
+			blocks[i] = Block{Type: TypeData, idx: idx, size: s.blockSize - 7, allocate: true, Next: next}
 		}
 		return nil
 	})
-	return ret
+	return
 }
 
-func (s *pagedStore) Free(idx int) error {
+func (s *blockStore) Erase(idx int) error {
 	return s.ensure(func() error {
-		if err := s.putPage(idx, TypeFree, 0, []byte{}); err != nil {
+		if idx == 0 {
+			return errors.New("super block can not be erased")
+		}
+		if err := s.putPage(idx, TypeEmpty, 0, []byte{}); err != nil {
 			return err
 		}
 		if s.freeTail != 0 {
-			if err := s.putPage(s.freeTail, TypeFree, idx, []byte{}); err != nil {
+			if err := s.putPage(s.freeTail, TypeEmpty, idx, []byte{}); err != nil {
 				return err
 			}
 		}
@@ -225,33 +241,39 @@ func (s *pagedStore) Free(idx int) error {
 	})
 }
 
-func (s *pagedStore) putPage(idx int, t Type, next int, data []byte) error {
+func (s *blockStore) putPage(idx int, t Type, next int, data []byte) error {
 	bs := s.pagePool.Get().([]byte)
 	defer s.pagePool.Put(bs)
 	bs[0] = byte(t)
 	binary.BigEndian.PutUint16(bs[1:3], uint16(len(data)))
 	binary.BigEndian.PutUint32(bs[3:7], uint32(next))
-	max := s.pageSize - 7
+	max := s.blockSize - 7
 	if len(data) > int(max) {
 		return fmt.Errorf("max user data length is %d", max)
 	}
 	copy(bs[7:7+len(data)], data)
-	pos := s.pagePos(idx)
+	pos := s.blockAt(idx)
 	if _, err := s.rws.Seek(pos, os.SEEK_SET); err != nil {
 		return err
 	}
 	writable := bs[:7+len(data)]
-	fmt.Printf("%d - %s\n", len(writable), writable)
 	if _, err := s.rws.Write(writable); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *pagedStore) Put(pages []Page) error {
+func (s *blockStore) Put(pages []Block) error {
 	return s.ensure(func() error {
 		freeHead := s.freeHead
+		var err error
 		for i := range pages {
+			if pages[i].Type == TypeEmpty {
+				return fmt.Errorf("can't put free block")
+			}
+			if pages[i].Type == TypeSuper && pages[i].idx != 0 {
+				return fmt.Errorf("super block must at position 0")
+			}
 			if !pages[i].allocate && pages[i].idx != freeHead {
 				return fmt.Errorf("put must begin with free head")
 			}
@@ -267,8 +289,8 @@ func (s *pagedStore) Put(pages []Page) error {
 			if pages[i+1].allocate {
 				freeHead = 0
 				s.freeTail = 0
-			} else {
-				freeHead = s.readFreeNext(freeHead)
+			} else if freeHead, err = s.nextFreeBlock(freeHead); err != nil {
+				return err
 			}
 		}
 		s.freeHead = freeHead
@@ -280,12 +302,11 @@ func (s *pagedStore) Put(pages []Page) error {
 	})
 }
 
-func (s *pagedStore) Get(idx int, page *Page) error {
+func (s *blockStore) Get(idx int, page *Block) error {
 	return s.ensure(func() error {
 		bs := s.pagePool.Get().([]byte)
 		defer s.pagePool.Put(bs)
-		pos := s.pagePos(idx)
-		fmt.Printf("index: %d - at: %d\n", idx, pos)
+		pos := s.blockAt(idx)
 		if _, err := s.rws.Seek(pos, os.SEEK_SET); err != nil {
 			return err
 		}
@@ -302,34 +323,68 @@ func (s *pagedStore) Get(idx int, page *Page) error {
 	})
 }
 
-func (s *pagedStore) pagePos(idx int) int64 {
-	if idx == 0 {
-		panic("index should begin with 1")
+func (s *blockStore) From(idx int) (blocks []Block, err error) {
+	blocks = []Block{}
+	var i = idx
+	for {
+		var block Block
+		if err = s.Get(i, &block); err != nil {
+			return
+		}
+		blocks = append(blocks, block)
+		if block.Next != 0 {
+			i = block.Next
+			continue
+		}
+		break
 	}
-	return int64(dataStartAt + int(s.pageSize)*idx)
+	return
 }
 
-func (s *pagedStore) readFreeNext(freeIdx int) (nextIdx int) {
+func (s *blockStore) WriteTo(w io.Writer, idx int) (blocks []Block, err error) {
+	var i = idx
+	for {
+		var block Block
+		if err = s.Get(i, &block); err != nil {
+			return
+		}
+		blocks = append(blocks, block)
+		if _, err = w.Write(block.Data); err != nil {
+			return
+		}
+		if block.Next != 0 {
+			i = block.Next
+			continue
+		}
+		return
+	}
+}
+
+func (s *blockStore) blockAt(idx int) int64 {
+	return int64(dataStartAt + int(s.blockSize)*idx)
+}
+
+func (s *blockStore) nextFreeBlock(freeIdx int) (nextIdx int, err error) {
 	bs := s.pagePool.Get().([]byte)
 	defer s.pagePool.Put(bs)
-	pos := s.pagePos(freeIdx)
-	if _, err := s.rws.Seek(pos, os.SEEK_SET); err != nil {
-		panic(err)
+	pos := s.blockAt(freeIdx)
+	if _, err = s.rws.Seek(pos, os.SEEK_SET); err != nil {
+		return
 	}
-	if _, err := s.rws.Read(bs); err != nil {
-		panic(err)
+	if _, err = s.rws.Read(bs[:7]); err != nil {
+		return
 	}
-	if Type(bs[0]) != TypeFree {
+	if Type(bs[0]) != TypeEmpty {
 		panic("not a free page")
 	}
 	nextIdx = int(binary.BigEndian.Uint32(bs[3:7]))
 	return
 }
 
-func (s *pagedStore) syncMetaData() error {
+func (s *blockStore) syncMetaData() error {
 	bs := metaPool.Get().([]byte)
 	start := 0
-	binary.BigEndian.PutUint16(bs[start:start+2], s.pageSize)
+	binary.BigEndian.PutUint16(bs[start:start+2], s.blockSize)
 	binary.BigEndian.PutUint32(bs[start+2:start+6], uint32(s.freeHead))
 	binary.BigEndian.PutUint32(bs[start+6:start+10], uint32(s.freeTail))
 	binary.BigEndian.PutUint32(bs[start+10:start+14], uint32(s.total))
@@ -341,14 +396,14 @@ func (s *pagedStore) syncMetaData() error {
 	return err
 }
 
-func (s *pagedStore) ensure(handle func() error) error {
+func (s *blockStore) ensure(handle func() error) error {
 	if !s.prepared {
-		panic("you should call Open or Create before any operation")
+		return errors.New("you should call Open or Create before any operation")
 	}
 	return handle()
 }
 
-func (s *pagedStore) emptyRWSC() (em bool, err error) {
+func (s *blockStore) emptyRWSC() (em bool, err error) {
 	var total int64
 	if total, err = s.rws.Seek(0, os.SEEK_END); err != nil {
 		return
@@ -356,4 +411,8 @@ func (s *pagedStore) emptyRWSC() (em bool, err error) {
 	em = total == 0
 	_, err = s.rws.Seek(0, os.SEEK_SET)
 	return
+}
+
+func (s *blockStore) DataSize() uint16 {
+	return s.blockSize - 7
 }
