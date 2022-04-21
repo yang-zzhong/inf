@@ -48,6 +48,7 @@ var (
 			return make([]byte, magicSize+metaSize)
 		},
 	}
+	ErrRWSCNotExists = errors.New("rwsc not exists")
 )
 
 func (v version) String() string {
@@ -155,7 +156,7 @@ func (s *blockStore) Open() (err error) {
 	if em, e := s.emptyRWSC(); e != nil {
 		return e
 	} else if em {
-		return fmt.Errorf("rwsc not exists")
+		return ErrRWSCNotExists
 	}
 	bs := headerPool.Get().([]byte)
 	if _, err = s.rws.Read(bs); err != nil {
@@ -342,22 +343,15 @@ func (s *blockStore) From(idx int) (blocks []Block, err error) {
 }
 
 func (s *blockStore) WriteTo(w io.Writer, idx int) (blocks []Block, err error) {
-	var i = idx
-	for {
-		var block Block
-		if err = s.Get(i, &block); err != nil {
-			return
-		}
-		blocks = append(blocks, block)
+	if blocks, err = s.From(idx); err != nil {
+		return
+	}
+	for _, block := range blocks {
 		if _, err = w.Write(block.Data); err != nil {
 			return
 		}
-		if block.Next != 0 {
-			i = block.Next
-			continue
-		}
-		return
 	}
+	return
 }
 
 func (s *blockStore) blockAt(idx int) int64 {

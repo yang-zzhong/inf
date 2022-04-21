@@ -8,7 +8,7 @@ import (
 )
 
 func testBlockStore(t *testing.T, test func(s *blockStore)) {
-	s := New(FileRWSC("./testdata/chunk"))
+	s := New(FileRWSC("./block.fsf"))
 	if err := s.Create(V010000, 512); err != nil {
 		t.Fatalf("new file chunk error: %s", err.Error())
 	}
@@ -17,7 +17,7 @@ func testBlockStore(t *testing.T, test func(s *blockStore)) {
 }
 
 func cleanup(handle func()) {
-	defer os.Remove("./testdata/chunk")
+	defer os.Remove("./block.fsf")
 	handle()
 }
 
