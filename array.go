@@ -10,6 +10,7 @@ type array [][]byte
 func (a *array) Insert(item []byte) {
 	data := *a
 	idx, _ := a.shouldBe(item)
+	fmt.Printf("insert into a\n")
 	data = append(data[:idx], append([][]byte{item}, data[idx:]...)...)
 }
 
@@ -39,6 +40,10 @@ func (a *array) Find(item []byte) int {
 
 func (a *array) shouldBe(item []byte) (pos int, exactly bool) {
 	data := *a
+	if len(data) == 0 {
+		pos = 0
+		return
+	}
 	var left int = 0
 	var right int = len(data) - 1 // 注意
 	for left <= right {

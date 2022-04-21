@@ -2,7 +2,6 @@ package inf
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"testing"
 )
@@ -22,34 +21,36 @@ func cleanup(handle func()) {
 }
 
 func Test_version_String(t *testing.T) {
-	fmt.Printf("version: %s\n", V010000.String())
+	if V010000.String() != "v01.00.00" {
+		t.Fatalf("v string error")
+	}
 }
 
-func TestPaged(t *testing.T) {
-	cleanup(func() {
-		testBlockStore(t, func(s *blockStore) {
-			fmt.Printf("%v\n", s)
-			pages, _ := s.Acquire(5050)
-			fmt.Printf("%v\n", pages)
-			for i := range pages {
-				pages[i].Data = []byte("hello world")
-			}
-			s.Put(pages)
-			for i := range pages {
-				s.Get(pages[i].idx, &pages[i])
-				fmt.Printf("%s - %d\n", pages[i].Data, pages[i].Next)
-			}
-			for i := 1; i <= 2; i++ {
-				if err := s.Erase(i); err != nil {
-					panic(err)
-				}
-				fmt.Printf("%v\n", s)
-			}
-			pages, _ = s.Acquire(512)
-			fmt.Printf("%v\n", pages)
-		})
-	})
-}
+// func TestPaged(t *testing.T) {
+// 	cleanup(func() {
+// 		testBlockStore(t, func(s *blockStore) {
+// 			fmt.Printf("%v\n", s)
+// 			pages, _ := s.Acquire(5050)
+// 			fmt.Printf("%v\n", pages)
+// 			for i := range pages {
+// 				pages[i].Data = []byte("hello world")
+// 			}
+// 			s.Put(pages)
+// 			for i := range pages {
+// 				s.Get(pages[i].idx, &pages[i])
+// 				fmt.Printf("%s - %d\n", pages[i].Data, pages[i].Next)
+// 			}
+// 			for i := 1; i <= 2; i++ {
+// 				if err := s.Erase(i); err != nil {
+// 					panic(err)
+// 				}
+// 				fmt.Printf("%v\n", s)
+// 			}
+// 			pages, _ = s.Acquire(512)
+// 			fmt.Printf("%v\n", pages)
+// 		})
+// 	})
+// }
 
 func Test_blockStore_Acquire(t *testing.T) {
 	cleanup(func() {
