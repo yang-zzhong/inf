@@ -32,12 +32,13 @@ const (
 	dataStartAt = 128
 	TypeEmpty   = Type(0)
 	TypeSuper   = Type(1)
-	TypeData    = Type(2)
+	TypeSingle  = Type(2)
+	TypeChained = Type(3)
 )
 
 var (
 	V010000     version
-	magicNumber = [magicSize]byte{'f', '.', 'f', 's', 'f'}
+	magicNumber = [magicSize]byte{'f', '.', 'b', 'l', 'k'}
 	metaPool    = sync.Pool{
 		New: func() interface{} {
 			return make([]byte, metaSize)
@@ -187,6 +188,10 @@ func (s *blockStore) Open() (err error) {
 func (s *blockStore) Acquire(lenInBytes int) (blocks []Block, err error) {
 	count := int(math.Ceil(float64(lenInBytes) / float64(s.DataSize())))
 	blocks = make([]Block, count)
+	ty := TypeSingle
+	if count > 0 {
+		ty = TypeChained
+	}
 	err = s.ensure(func() error {
 		i := 0
 		freeIdx := s.freeHead
@@ -203,7 +208,7 @@ func (s *blockStore) Acquire(lenInBytes int) (blocks []Block, err error) {
 			} else if next == 0 {
 				next = s.total + 1
 			}
-			blocks[i] = Block{Type: TypeData, idx: freeIdx, size: s.DataSize(), Next: next}
+			blocks[i] = Block{Type: ty, idx: freeIdx, size: s.DataSize(), Next: next}
 			freeIdx = next
 			i++
 		}
@@ -214,7 +219,7 @@ func (s *blockStore) Acquire(lenInBytes int) (blocks []Block, err error) {
 			if i == count-1 {
 				next = 0
 			}
-			blocks[i] = Block{Type: TypeData, idx: idx, size: s.blockSize - 7, allocate: true, Next: next}
+			blocks[i] = Block{Type: ty, idx: idx, size: s.blockSize - 7, allocate: true, Next: next}
 		}
 		return nil
 	})
@@ -247,17 +252,21 @@ func (s *blockStore) putPage(idx int, t Type, next int, data []byte) error {
 	defer s.pagePool.Put(bs)
 	bs[0] = byte(t)
 	binary.BigEndian.PutUint16(bs[1:3], uint16(len(data)))
-	binary.BigEndian.PutUint32(bs[3:7], uint32(next))
-	max := s.blockSize - 7
+	var hl = 3
+	if t == TypeChained {
+		binary.BigEndian.PutUint32(bs[3:7], uint32(next))
+		hl = 7
+	}
+	max := int(s.blockSize) - hl
 	if len(data) > int(max) {
 		return fmt.Errorf("max user data length is %d", max)
 	}
-	copy(bs[7:7+len(data)], data)
+	copy(bs[hl:hl+len(data)], data)
 	pos := s.blockAt(idx)
 	if _, err := s.rws.Seek(pos, os.SEEK_SET); err != nil {
 		return err
 	}
-	writable := bs[:7+len(data)]
+	writable := bs[:hl+len(data)]
 	if _, err := s.rws.Write(writable); err != nil {
 		return err
 	}
@@ -316,10 +325,14 @@ func (s *blockStore) Get(idx int, page *Block) error {
 		}
 		page.Type = Type(bs[0])
 		page.size = binary.BigEndian.Uint16(bs[1:3])
-		page.Next = int(binary.BigEndian.Uint32(bs[3:7]))
+		hl := 3
+		if page.Type == TypeChained {
+			page.Next = int(binary.BigEndian.Uint32(bs[3:7]))
+			hl = 7
+		}
 		page.Data = make([]byte, page.size)
 		page.idx = idx
-		copy(page.Data, bs[7:7+page.size])
+		copy(page.Data, bs[hl:hl+int(page.size)])
 		return nil
 	})
 }
@@ -333,6 +346,9 @@ func (s *blockStore) From(idx int) (blocks []Block, err error) {
 			return
 		}
 		blocks = append(blocks, block)
+		if block.Type != TypeChained {
+			return
+		}
 		if block.Next != 0 {
 			i = block.Next
 			continue

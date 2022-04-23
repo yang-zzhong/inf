@@ -12,8 +12,21 @@ type btree struct {
 }
 
 type pair struct {
-	key, val []byte
-	after    *node
+	key, val   []byte
+	withoutVal bool
+	valueBlock int
+	after      *node
+}
+
+func (p pair) mostleft() *node {
+	if p.after == nil {
+		return nil
+	}
+	n := p.after
+	for n.first != nil {
+		n = n.first
+	}
+	return n
 }
 
 func (p pair) Compare(t Comparable) int {
@@ -39,9 +52,10 @@ func (t *btree) Init() {
 
 func (t *btree) syncNode(n *node) error {
 	n.sync(t.blocks)
+	return nil
 }
 
-func (n *node) put(key, val []byte) {
+func (n *node) put(key, val []byte) error {
 	p := pair{key: key, val: val}
 	pos, exactly := n.data.shouldBe(p)
 	if exactly {
@@ -49,49 +63,88 @@ func (n *node) put(key, val []byte) {
 			p.after = n.data[pos].(pair).after
 			n.data[pos] = p
 		})
-		return
+		return nil
 	}
 	if pos == 0 {
 		if n.first != nil {
 			n.first.put(key, val)
-			return
+			return nil
 		}
 	} else if n.data[pos-1].(pair).after != nil {
 		n.data[pos-1].(pair).after.put(key, val)
-		return
+		return nil
 	}
+	var err error
 	n.set(func() {
 		n.data.insertAt(pos, p)
-		n.popup()
+		err = n.popup()
 	})
+	return err
 }
 
 func (n *node) del(key []byte) {
-
+	p := pair{key: key}
+	pos, exactly := n.data.shouldBe(p)
+	if !exactly {
+		if pos == 0 {
+			if n.first != nil {
+				n.first.del(key)
+			}
+		} else if pos < len(n.data) {
+			if c := n.data[pos-1].(pair).after; c != nil {
+				c.del(key)
+			}
+		}
+		return
+	}
+	p = n.data[pos].(pair)
+	n.data = append(n.data[:pos], n.data[pos+1:]...)
+	n.borrow(p)
 }
 
-func (n *node) popup() {
+func (n *node) borrow(p pair) {
+	if p.after != nil {
+
+	} else if n.p != nil {
+		np := n.p.popFirst()
+		n.data.insert(p)
+		if np.after != nil {
+			n.p.borrow(np)
+		}
+		return
+	}
+}
+
+func (n *node) popup() error {
 	if !n.overflow() {
-		return
+		return nil
 	}
-	nn, p := n.split()
+	if len(n.data) < 3 {
+		return errors.New("room is not enough")
+	}
+	nn, p := n.split(len(n.data) / 2)
 	if n.p != nil {
+		nn.p = n.p
 		pos, _ := n.p.data.shouldBe(p)
-		p.after = nn
 		n.p.data.insertAt(pos, p)
-		n.p.popup()
-		return
+		return n.p.popup()
 	}
-	p.after = nn
 	n.p = &node{first: n, data: []Comparable{p}, total: n.total}
 	nn.p = n.p
+	return nil
 }
 
-func (n *node) split() (nn *node, p pair) {
-	pos := len(n.data) / 2
+func (n *node) popFirst() (p pair) {
+	if len(n.data) == 0 {
+		panic("hhh")
+	}
+	p = n.data[0].(pair)
+	n.data = n.data[1:]
+	return
+}
 
+func (n *node) split(pos int) (nn *node, p pair) {
 	p = n.data[pos].(pair)
-
 	nd := make(array, pos)
 	copy(nd, n.data[:pos])
 	r := len(n.data) - pos - 1
@@ -101,9 +154,18 @@ func (n *node) split() (nn *node, p pair) {
 	nnd := make(array, r)
 	copy(nnd, n.data[pos+1:])
 	n.data = nd
-
 	nn = &node{data: nnd, total: n.total}
-
+	for i, p := range nn.data {
+		if p.(pair).after != nil {
+			p.(pair).after.p = nn
+			nn.data[i] = p
+		}
+	}
+	if p.after != nil {
+		p.after.p = nn
+		nn.first = p.after
+	}
+	p.after = nn
 	return
 }
 
@@ -178,7 +240,7 @@ func (n *node) sync(store *blockStore) error {
 		blocks[0].Data = bs
 		return store.Put(blocks)
 	}
-	block := Block{Type: TypeData, Data: bs, Next: 0, size: uint16(pos), idx: n.block}
+	block := Block{Type: TypeSingle, Data: bs, Next: 0, size: uint16(pos), idx: n.block}
 	return store.Put([]Block{block})
 }
 
