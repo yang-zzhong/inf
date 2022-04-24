@@ -18,17 +18,6 @@ type pair struct {
 	after      *node
 }
 
-func (p pair) mostleft() *node {
-	if p.after == nil {
-		return nil
-	}
-	n := p.after
-	for n.first != nil {
-		n = n.first
-	}
-	return n
-}
-
 func (p pair) Compare(t Comparable) int {
 	return bytes.Compare(p.key, t.(pair).key)
 }
@@ -99,19 +88,49 @@ func (n *node) del(key []byte) {
 	}
 	p = n.data[pos].(pair)
 	n.data = append(n.data[:pos], n.data[pos+1:]...)
-	n.borrow(p)
+	pairs := n.tempDel(p)
+	for _, pair := range pairs {
+		n.put(pair.key, pair.val)
+	}
 }
 
-func (n *node) borrow(p pair) {
-	if p.after != nil {
-
-	} else if n.p != nil {
-		np := n.p.popFirst()
-		n.data.insert(p)
-		if np.after != nil {
-			n.p.borrow(np)
+func (n *node) tempDel(p pair) []pair {
+	pos, exactly := n.data.shouldBe(p)
+	ret := []pair{}
+	if pos == 0 || pos == len(n.data) {
+		n.traverse(func(p pair) {
+			ret = append(ret, p)
+		})
+		if n.p != nil {
+			pos, _ := n.p.data.shouldBe(p)
+			if pos == 0 {
+				n.p.first = nil
+			} else {
+				n.p.data = append(n.p.data[:pos], n.p.data[pos+1:]...)
+			}
+			ret = append(ret, n.p.tempDel(p)...)
 		}
-		return
+		return ret
+	}
+	p = n.data[pos].(pair)
+	if p.after != nil {
+		ret = append(ret, p.after.tempDel(p)...)
+	}
+	if exactly {
+		ret = append(ret, p)
+	}
+	return ret
+}
+
+func (n *node) traverse(handle func(p pair)) {
+	if n.first != nil {
+		n.first.traverse(handle)
+	}
+	for _, p := range n.data {
+		handle(p.(pair))
+		if p.(pair).after != nil {
+			p.(pair).after.traverse(handle)
+		}
 	}
 }
 
@@ -132,15 +151,6 @@ func (n *node) popup() error {
 	n.p = &node{first: n, data: []Comparable{p}, total: n.total}
 	nn.p = n.p
 	return nil
-}
-
-func (n *node) popFirst() (p pair) {
-	if len(n.data) == 0 {
-		panic("hhh")
-	}
-	p = n.data[0].(pair)
-	n.data = n.data[1:]
-	return
 }
 
 func (n *node) split(pos int) (nn *node, p pair) {
