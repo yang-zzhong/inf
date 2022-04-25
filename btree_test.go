@@ -30,9 +30,9 @@ func TestNode_put(t *testing.T) {
 
 func TestNode_del(t *testing.T) {
 	tree := NewTree(16)
-	for i := 0; i <= 6; i++ {
+	for i := 0; i <= 10; i++ {
 		k := []byte(fmt.Sprintf("%02d", i))
 		tree.Put(Pair(k, k))
 	}
-	tree.Del(Key([]byte("00")))
+	tree.Del(Key([]byte("06")))
 }

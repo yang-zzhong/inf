@@ -63,13 +63,14 @@ type node struct {
 }
 
 func NewTree(total uint16) *btree {
-	n := &node{}
-	t := &btree{root: n, total: total}
-	n.tree = t
-	return t
+	return &btree{total: total}
 }
 
 func (tree *btree) Put(data Storeable) error {
+	if tree.root == nil {
+		tree.root = &node{data: []Comparable{element{data: data}}, tree: tree}
+		return nil
+	}
 	err := tree.root.put(data)
 	tree.root = tree.root.root()
 	return err
@@ -77,6 +78,9 @@ func (tree *btree) Put(data Storeable) error {
 
 func (tree *btree) Del(data Storeable) {
 	tree.root = tree.root.del(data)
+	if len(tree.root.data) == 0 {
+		tree.root = tree.root.first
+	}
 }
 
 func (tree *btree) Get(data Storeable) (Storeable, error) {
@@ -118,7 +122,7 @@ func (n *node) del(data Storeable) *node {
 			if n.first != nil {
 				return n.first.del(data)
 			}
-		} else if pos < len(n.data) {
+		} else {
 			if c := n.data[pos-1].(element).after; c != nil {
 				return c.del(data)
 			}
@@ -152,18 +156,46 @@ func (n *node) delLeaf(pos int) *node {
 }
 
 func (n *node) borrow(p element) *node {
-	if n.p != nil {
-		pos, _ := n.p.data.shouldBe(p)
+	if n.p == nil {
+		return n
+	}
+	pos, _ := n.p.data.shouldBe(p)
+	if pos == 0 {
 		np := n.p.data[pos].(element)
 		if np.after != nil {
 			after := np.after
 			np.after = after.first
 			n.data = append([]Comparable{np}, after.data...)
 		}
-		n.p.data = append(n.p.data[:pos], n.p.data[pos+1:]...)
-		if len(n.p.data) == 0 {
-			n.p.borrow(np)
+		if p.after != nil {
+			n.first = p.after
 		}
+		n.p.data = append(n.p.data[:pos], n.p.data[pos+1:]...)
+		if len(n.p.data) == 0 && n.p.p != nil {
+			return n.p.borrow(np)
+		}
+		return n.root()
+	}
+	pos -= 1
+	np := n.p.data[pos].(element)
+	p.data = np.data
+	if n.first != nil {
+		p.after = n.first
+	}
+	n.data = []Comparable{p}
+	n.p.data = append(n.p.data[:pos], n.p.data[pos+1:]...)
+	ppos := pos - 1
+	if ppos == -1 && n.p.first != nil {
+		n.data = append(n.p.first.data, n.data...)
+		n.first = n.p.first.first
+		n.p.first = n
+	} else if bnp := n.p.data[ppos].(element); bnp.after != nil {
+		n.data = append(bnp.after.data, n.data...)
+		bnp.after = n
+		n.p.data[ppos] = bnp
+	}
+	if len(n.p.data) == 0 && n.p.p != nil {
+		return n.p.borrow(np)
 	}
 	return n.root()
 }
