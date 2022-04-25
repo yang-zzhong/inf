@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"sync"
 )
 
 type btree struct {
@@ -17,7 +18,7 @@ type Storeable interface {
 	Size(max int) int
 }
 
-type element struct {
+type elem struct {
 	data  Storeable
 	after *node
 }
@@ -26,12 +27,20 @@ type pair struct {
 	Key, Val []byte
 }
 
-func Pair(key, val []byte) pair {
+func BP(key, val []byte) pair {
 	return pair{Key: key, Val: val}
 }
 
-func Key(key []byte) pair {
+func SP(key, val string) pair {
+	return pair{Key: []byte(key), Val: []byte(val)}
+}
+
+func BK(key []byte) pair {
 	return pair{Key: key}
+}
+
+func SK(key string) pair {
+	return pair{Key: []byte(key)}
 }
 
 func (p pair) Bytes(max int) [][]byte {
@@ -49,36 +58,36 @@ func (p pair) Compare(t Comparable) int {
 	return bytes.Compare(p.Key, t.(pair).Key)
 }
 
-func (p element) Compare(t Comparable) int {
-	return p.data.Compare(t.(element).data)
+func (p elem) Compare(t Comparable) int {
+	return p.data.Compare(t.(elem).data)
 }
 
 type node struct {
-	data   array
+	elems  array
 	first  *node
 	p      *node
 	block  int
 	synced bool
 	tree   *btree
+	lock   sync.Mutex
 }
 
 func NewTree(total uint16) *btree {
 	return &btree{total: total}
 }
 
-func (tree *btree) Put(data Storeable) error {
+func (tree *btree) Put(data Storeable) {
 	if tree.root == nil {
-		tree.root = &node{data: []Comparable{element{data: data}}, tree: tree}
-		return nil
+		tree.root = &node{elems: []Comparable{elem{data: data}}, tree: tree}
+		return
 	}
-	err := tree.root.put(data)
+	tree.root.put(data)
 	tree.root = tree.root.root()
-	return err
 }
 
 func (tree *btree) Del(data Storeable) {
 	tree.root = tree.root.del(data)
-	if len(tree.root.data) == 0 {
+	if len(tree.root.elems) == 0 {
 		tree.root = tree.root.first
 	}
 }
@@ -87,43 +96,42 @@ func (tree *btree) Get(data Storeable) (Storeable, error) {
 	return tree.root.get(data)
 }
 
-func (n *node) put(data Storeable) error {
-	p := element{data: data}
-	pos, exactly := n.data.shouldBe(p)
+func (n *node) put(data Storeable) {
+	p := elem{data: data}
+	pos, exactly := n.elems.shouldBe(p)
 	if exactly {
 		n.set(func() {
-			p.after = n.data[pos].(element).after
-			n.data[pos] = p
+			p.after = n.elems[pos].(elem).after
+			n.elems[pos] = p
 		})
-		return nil
+		return
 	}
 	if pos == 0 {
 		if n.first != nil {
 			n.first.put(data)
-			return nil
+			return
 		}
-	} else if n.data[pos-1].(element).after != nil {
-		n.data[pos-1].(element).after.put(data)
-		return nil
+	} else if n.elems[pos-1].(elem).after != nil {
+		n.elems[pos-1].(elem).after.put(data)
+		return
 	}
-	var err error
 	n.set(func() {
-		n.data.insertAt(pos, p)
-		err = n.popup()
+		n.elems.insertAt(pos, p)
+		n.popup()
 	})
-	return err
+	return
 }
 
 func (n *node) del(data Storeable) *node {
-	p := element{data: data}
-	pos, exactly := n.data.shouldBe(p)
+	p := elem{data: data}
+	pos, exactly := n.elems.shouldBe(p)
 	if !exactly {
 		if pos == 0 {
 			if n.first != nil {
 				return n.first.del(data)
 			}
 		} else {
-			if c := n.data[pos-1].(element).after; c != nil {
+			if c := n.elems[pos-1].(elem).after; c != nil {
 				return c.del(data)
 			}
 		}
@@ -131,15 +139,24 @@ func (n *node) del(data Storeable) *node {
 	if n.leaf() {
 		return n.delLeaf(pos)
 	}
-	return nil
+	return n.delNonLeaf(pos)
+}
+
+func (n *node) delNonLeaf(pos int) *node {
+	p := n.elems[pos].(elem)
+	n.elems = append(n.elems[:pos], n.elems[pos+1:]...)
+	if len(n.elems) == 0 {
+		return n.merge(p)
+	}
+	return n.root()
 }
 
 func (n *node) leaf() bool {
 	if n.first != nil {
 		return false
 	}
-	for _, p := range n.data {
-		if p.(element).after != nil {
+	for _, p := range n.elems {
+		if p.(elem).after != nil {
 			return false
 		}
 	}
@@ -147,94 +164,107 @@ func (n *node) leaf() bool {
 }
 
 func (n *node) delLeaf(pos int) *node {
-	p := n.data[pos].(element)
-	n.data = append(n.data[:pos], n.data[pos+1:]...)
-	if len(n.data) != 0 {
+	p := n.elems[pos].(elem)
+	n.elems = append(n.elems[:pos], n.elems[pos+1:]...)
+	if len(n.elems) != 0 {
 		return n.root()
 	}
-	return n.borrow(p)
+	return n.merge(p)
 }
 
-func (n *node) borrow(p element) *node {
-	if n.p == nil {
-		return n
+func (n *node) mergeRight(pos int, p elem) *node {
+	np := n.p.elems[pos].(elem)
+	if np.after != nil {
+		after := np.after
+		np.after = after.first
+		n.elems = append([]Comparable{np}, after.elems...)
 	}
-	pos, _ := n.p.data.shouldBe(p)
-	if pos == 0 {
-		np := n.p.data[pos].(element)
-		if np.after != nil {
-			after := np.after
-			np.after = after.first
-			n.data = append([]Comparable{np}, after.data...)
+	if p.after != nil {
+		if n.first != nil {
+			p.after.elems = append(n.first.elems, p.after.elems...)
 		}
-		if p.after != nil {
-			n.first = p.after
-		}
-		n.p.data = append(n.p.data[:pos], n.p.data[pos+1:]...)
-		if len(n.p.data) == 0 && n.p.p != nil {
-			return n.p.borrow(np)
-		}
-		return n.root()
+		n.first = p.after
 	}
-	pos -= 1
-	np := n.p.data[pos].(element)
-	p.data = np.data
-	if n.first != nil {
-		p.after = n.first
-	}
-	n.data = []Comparable{p}
-	n.p.data = append(n.p.data[:pos], n.p.data[pos+1:]...)
-	ppos := pos - 1
-	if ppos == -1 && n.p.first != nil {
-		n.data = append(n.p.first.data, n.data...)
-		n.first = n.p.first.first
-		n.p.first = n
-	} else if bnp := n.p.data[ppos].(element); bnp.after != nil {
-		n.data = append(bnp.after.data, n.data...)
-		bnp.after = n
-		n.p.data[ppos] = bnp
-	}
-	if len(n.p.data) == 0 && n.p.p != nil {
-		return n.p.borrow(np)
+	n.p.elems = append(n.p.elems[:pos], n.p.elems[pos+1:]...)
+	n.popup()
+	if len(n.p.elems) == 0 && n.p.p != nil {
+		return n.p.merge(np)
 	}
 	return n.root()
 }
 
-func (n *node) popup() error {
-	if !n.overflow() {
-		return nil
+func (n *node) mergeLeft(pos int, p elem) *node {
+	pos -= 1
+	np := n.p.elems[pos].(elem)
+	p.data = np.data
+	if n.first != nil {
+		if p.after != nil {
+			n.first.elems = append(n.first.elems, p.after.elems...)
+		}
+		p.after = n.first
 	}
-	if len(n.data) < 3 {
-		return errors.New("room is not enough")
+	n.elems = []Comparable{p}
+	n.p.elems = append(n.p.elems[:pos], n.p.elems[pos+1:]...)
+	ppos := pos - 1
+	if ppos == -1 && n.p.first != nil {
+		n.elems = append(n.p.first.elems, n.elems...)
+		n.first = n.p.first.first
+		n.p.first = n
+	} else if bnp := n.p.elems[ppos].(elem); bnp.after != nil {
+		n.elems = append(bnp.after.elems, n.elems...)
+		bnp.after = n
+		n.p.elems[ppos] = bnp
 	}
-	nn, p := n.split(len(n.data) / 2)
-	if n.p != nil {
-		nn.p = n.p
-		pos, _ := n.p.data.shouldBe(p)
-		n.p.data.insertAt(pos, p)
-		return n.p.popup()
+	n.popup()
+	if len(n.p.elems) == 0 && n.p.p != nil {
+		return n.p.merge(np)
 	}
-	n.p = &node{first: n, data: []Comparable{p}, tree: n.tree}
-	nn.p = n.p
-	return nil
+	return n.root()
 }
 
-func (n *node) split(pos int) (nn *node, p element) {
-	p = n.data[pos].(element)
+func (n *node) merge(p elem) *node {
+	if n.p == nil {
+		return n
+	}
+	pos, _ := n.p.elems.shouldBe(p)
+	if pos == 0 {
+		return n.mergeRight(pos, p)
+	}
+	return n.mergeLeft(pos, p)
+}
+
+func (n *node) popup() {
+	if !n.overflow() {
+		return
+	}
+	nn, p := n.split(len(n.elems) / 2)
+	if n.p != nil {
+		nn.p = n.p
+		pos, _ := n.p.elems.shouldBe(p)
+		n.p.elems.insertAt(pos, p)
+		n.p.popup()
+	}
+	n.p = &node{first: n, elems: []Comparable{p}, tree: n.tree}
+	nn.p = n.p
+	return
+}
+
+func (n *node) split(pos int) (nn *node, p elem) {
+	p = n.elems[pos].(elem)
 	nd := make(array, pos)
-	copy(nd, n.data[:pos])
-	r := len(n.data) - pos - 1
+	copy(nd, n.elems[:pos])
+	r := len(n.elems) - pos - 1
 	if r <= 0 {
 		return
 	}
 	nnd := make(array, r)
-	copy(nnd, n.data[pos+1:])
-	n.data = nd
-	nn = &node{data: nnd, tree: n.tree}
-	for i, p := range nn.data {
-		if p.(element).after != nil {
-			p.(element).after.p = nn
-			nn.data[i] = p
+	copy(nnd, n.elems[pos+1:])
+	n.elems = nd
+	nn = &node{elems: nnd, tree: n.tree}
+	for i, p := range nn.elems {
+		if p.(elem).after != nil {
+			p.(elem).after.p = nn
+			nn.elems[i] = p
 		}
 	}
 	if p.after != nil {
@@ -246,9 +276,9 @@ func (n *node) split(pos int) (nn *node, p element) {
 }
 
 func (n *node) get(data Storeable) (ret Storeable, err error) {
-	pos, exactly := n.data.shouldBe(element{data: data})
+	pos, exactly := n.elems.shouldBe(elem{data: data})
 	if exactly {
-		ret = n.data[pos].(element).data
+		ret = n.elems[pos].(elem).data
 		return
 	}
 	if pos == 0 {
@@ -259,7 +289,7 @@ func (n *node) get(data Storeable) (ret Storeable, err error) {
 		err = errors.New("not found")
 		return
 	}
-	child := n.data[pos-1].(element).after
+	child := n.elems[pos-1].(elem).after
 	if child == nil {
 		err = errors.New("not found")
 		return
@@ -274,8 +304,8 @@ func (n *node) overflow() bool {
 
 func (n *node) shouldUse() int {
 	t := 6
-	for _, p := range n.data {
-		t += p.(element).data.Size(n.elemMax())
+	for _, p := range n.elems {
+		t += p.(elem).data.Size(n.elemMax())
 	}
 	return t
 }
@@ -297,15 +327,15 @@ func (n *node) sync(store *blockStore) error {
 	binary.BigEndian.PutUint32(bs[:4], uint32(first))
 	binary.BigEndian.PutUint16(bs[4:6], uint16(n.tree.total))
 	pos := 6
-	for _, p := range n.data {
-		elem := p.(element).data
-		size := elem.Size(n.elemMax())
-		copy(bs[pos:pos+size], elem.Bytes(n.elemMax())[0])
+	for _, p := range n.elems {
+		el := p.(elem).data
+		size := el.Size(n.elemMax())
+		copy(bs[pos:pos+size], el.Bytes(n.elemMax())[0])
 		pos += size
 		after := 0
-		if p.(element).after != nil {
-			p.(element).after.sync(store)
-			after = p.(element).after.block
+		if p.(elem).after != nil {
+			p.(elem).after.sync(store)
+			after = p.(elem).after.block
 		}
 		binary.BigEndian.PutUint32(bs[pos:pos+4], uint32(after))
 		pos += 4
@@ -323,6 +353,8 @@ func (n *node) sync(store *blockStore) error {
 }
 
 func (n *node) set(do func()) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
 	do()
 	n.synced = false
 }
