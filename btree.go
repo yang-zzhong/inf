@@ -10,6 +10,7 @@ import (
 type btree struct {
 	root  *node
 	total uint16 // total key bytes
+	lock  sync.RWMutex
 }
 
 type Storeable interface {
@@ -69,7 +70,6 @@ type node struct {
 	block  int
 	synced bool
 	tree   *btree
-	lock   sync.Mutex
 }
 
 func NewTree(total uint16) *btree {
@@ -77,6 +77,8 @@ func NewTree(total uint16) *btree {
 }
 
 func (tree *btree) Put(data Storeable) {
+	tree.lock.Lock()
+	defer tree.lock.Unlock()
 	if tree.root == nil {
 		tree.root = &node{elems: []Comparable{elem{data: data}}, tree: tree}
 		return
@@ -86,6 +88,8 @@ func (tree *btree) Put(data Storeable) {
 }
 
 func (tree *btree) Del(data Storeable) {
+	tree.lock.Lock()
+	defer tree.lock.Unlock()
 	tree.root = tree.root.del(data)
 	if len(tree.root.elems) == 0 {
 		tree.root = tree.root.first
@@ -93,6 +97,8 @@ func (tree *btree) Del(data Storeable) {
 }
 
 func (tree *btree) Get(data Storeable) (Storeable, error) {
+	tree.lock.RLock()
+	defer tree.lock.RUnlock()
 	return tree.root.get(data)
 }
 
@@ -243,10 +249,10 @@ func (n *node) popup() {
 		pos, _ := n.p.elems.shouldBe(p)
 		n.p.elems.insertAt(pos, p)
 		n.p.popup()
+		return
 	}
 	n.p = &node{first: n, elems: []Comparable{p}, tree: n.tree}
 	nn.p = n.p
-	return
 }
 
 func (n *node) split(pos int) (nn *node, p elem) {
@@ -353,8 +359,6 @@ func (n *node) sync(store *blockStore) error {
 }
 
 func (n *node) set(do func()) {
-	n.lock.Lock()
-	defer n.lock.Unlock()
 	do()
 	n.synced = false
 }
