@@ -263,7 +263,7 @@ func (s *blockStore) putPage(idx int, t Type, next int, data []byte) error {
 	}
 	copy(bs[hl:hl+len(data)], data)
 	pos := s.blockAt(idx)
-	if _, err := s.rws.Seek(pos, os.SEEK_SET); err != nil {
+	if _, err := s.rws.Seek(pos, io.SeekStart); err != nil {
 		return err
 	}
 	writable := bs[:hl+len(data)]
@@ -317,7 +317,7 @@ func (s *blockStore) Get(idx int, page *Block) error {
 		bs := s.pagePool.Get().([]byte)
 		defer s.pagePool.Put(bs)
 		pos := s.blockAt(idx)
-		if _, err := s.rws.Seek(pos, os.SEEK_SET); err != nil {
+		if _, err := s.rws.Seek(pos, io.SeekStart); err != nil {
 			return err
 		}
 		if _, err := s.rws.Read(bs); err != nil {
@@ -378,7 +378,7 @@ func (s *blockStore) nextFreeBlock(freeIdx int) (nextIdx int, err error) {
 	bs := s.pagePool.Get().([]byte)
 	defer s.pagePool.Put(bs)
 	pos := s.blockAt(freeIdx)
-	if _, err = s.rws.Seek(pos, os.SEEK_SET); err != nil {
+	if _, err = s.rws.Seek(pos, io.SeekStart); err != nil {
 		return
 	}
 	if _, err = s.rws.Read(bs[:7]); err != nil {
@@ -399,7 +399,7 @@ func (s *blockStore) syncMetaData() error {
 	binary.BigEndian.PutUint32(bs[start+6:start+10], uint32(s.freeTail))
 	binary.BigEndian.PutUint32(bs[start+10:start+14], uint32(s.total))
 	copy(bs[start+14:start+20], s.v[:])
-	if _, err := s.rws.Seek(magicSize, os.SEEK_SET); err != nil {
+	if _, err := s.rws.Seek(magicSize, io.SeekStart); err != nil {
 		return err
 	}
 	_, err := s.rws.Write(bs)
@@ -419,7 +419,7 @@ func (s *blockStore) emptyRWSC() (em bool, err error) {
 		return
 	}
 	em = total == 0
-	_, err = s.rws.Seek(0, os.SEEK_SET)
+	_, err = s.rws.Seek(0, io.SeekStart)
 	return
 }
 

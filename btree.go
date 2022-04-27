@@ -83,8 +83,7 @@ func (tree *btree) Put(data Storeable) {
 		tree.root = &node{elems: []Comparable{elem{data: data}}, tree: tree}
 		return
 	}
-	tree.root.put(data)
-	tree.root = tree.root.root()
+	tree.root = tree.root.put(data)
 }
 
 func (tree *btree) Del(data Storeable) {
@@ -102,30 +101,23 @@ func (tree *btree) Get(data Storeable) (Storeable, error) {
 	return tree.root.get(data)
 }
 
-func (n *node) put(data Storeable) {
+func (n *node) put(data Storeable) *node {
 	p := elem{data: data}
 	pos, exactly := n.elems.shouldBe(p)
 	if exactly {
-		n.set(func() {
-			p.after = n.elems[pos].(elem).after
-			n.elems[pos] = p
-		})
-		return
+		p.after = n.elems[pos].(elem).after
+		n.elems[pos] = p
+		return n.root()
 	}
 	if pos == 0 {
 		if n.first != nil {
-			n.first.put(data)
-			return
+			return n.first.put(data)
 		}
 	} else if n.elems[pos-1].(elem).after != nil {
-		n.elems[pos-1].(elem).after.put(data)
-		return
+		return n.elems[pos-1].(elem).after.put(data)
 	}
-	n.set(func() {
-		n.elems.insertAt(pos, p)
-		n.popup()
-	})
-	return
+	n.elems.insertAt(pos, p)
+	return n.popup()
 }
 
 func (n *node) del(data Storeable) *node {
@@ -183,6 +175,9 @@ func (n *node) mergeRight(pos int, p elem) *node {
 	if np.after != nil {
 		after := np.after
 		np.after = after.first
+		if after.first != nil {
+			after.first.p = n
+		}
 		n.elems = append([]Comparable{np}, after.elems...)
 	}
 	if p.after != nil {
@@ -202,13 +197,11 @@ func (n *node) mergeRight(pos int, p elem) *node {
 func (n *node) mergeLeft(pos int, p elem) *node {
 	pos -= 1
 	np := n.p.elems[pos].(elem)
-	p.data = np.data
-	if n.first != nil {
-		if p.after != nil {
-			n.first.elems = append(n.first.elems, p.after.elems...)
-		}
+	if p.after == nil && n.first != nil && np.Compare(n.first.elems[0]) < 0 {
 		p.after = n.first
+		n.first = nil
 	}
+	p.data = np.data
 	n.elems = []Comparable{p}
 	n.p.elems = append(n.p.elems[:pos], n.p.elems[pos+1:]...)
 	ppos := pos - 1
@@ -239,20 +232,20 @@ func (n *node) merge(p elem) *node {
 	return n.mergeLeft(pos, p)
 }
 
-func (n *node) popup() {
+func (n *node) popup() *node {
 	if !n.overflow() {
-		return
+		return n.root()
 	}
 	nn, p := n.split(len(n.elems) / 2)
-	if n.p != nil {
+	if n.p == nil {
+		n.p = &node{first: n, elems: []Comparable{p}, tree: n.tree}
 		nn.p = n.p
-		pos, _ := n.p.elems.shouldBe(p)
-		n.p.elems.insertAt(pos, p)
-		n.p.popup()
-		return
+		return n.p
 	}
-	n.p = &node{first: n, elems: []Comparable{p}, tree: n.tree}
 	nn.p = n.p
+	pos, _ := n.p.elems.shouldBe(p)
+	n.p.elems.insertAt(pos, p)
+	return n.p.popup()
 }
 
 func (n *node) split(pos int) (nn *node, p elem) {
